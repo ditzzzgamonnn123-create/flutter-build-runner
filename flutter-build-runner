@@ -1,1 +1,119 @@
-.github/workflows/build-apk.yml
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag yang berisi source zip"
+        required: true
+      build_type:
+        description: "debug atau release"
+        required: true
+        default: "release"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download source zip dari release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.zip" \
+            --dir source
+
+      - name: Extract project
+        run: |
+          mkdir -p project
+          cd source
+          ZIPFILE=$(ls *.zip | head -n1)
+          unzip -q "$ZIPFILE" -d ../project
+
+      # Support "all base zip": entah pubspec.yaml/gradlew ada di root zip
+      # atau terbungkus di dalam satu folder, tetap ditemukan otomatis.
+      # Mendeteksi 2 kemungkinan jenis project:
+      #   - Flutter  : ada pubspec.yaml
+      #   - Native Android (Gradle/Java/Kotlin) : ada gradlew di root project
+      - name: Deteksi jenis project
+        id: locate
+        run: |
+          PUBSPEC_DIR=$(find project -maxdepth 6 -name "pubspec.yaml" -printf '%h\n' | head -n1)
+          if [ -n "$PUBSPEC_DIR" ]; then
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            echo "dir=$PUBSPEC_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          GRADLEW_DIR=$(find project -maxdepth 3 -name "gradlew" -printf '%h\n' | head -n1)
+          if [ -n "$GRADLEW_DIR" ]; then
+            echo "type=native" >> "$GITHUB_OUTPUT"
+            echo "dir=$GRADLEW_DIR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Tidak ditemukan pubspec.yaml (Flutter) maupun gradlew (native Android) di dalam zip!"
+          exit 1
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        if: steps.locate.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+
+      - name: Flutter pub get
+        if: steps.locate.outputs.type == 'flutter'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: flutter pub get
+
+      - name: Build APK - Flutter (debug)
+        if: steps.locate.outputs.type == 'flutter' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: flutter build apk --debug
+
+      - name: Build APK - Flutter (release)
+        if: steps.locate.outputs.type == 'flutter' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: flutter build apk --release
+
+      - name: Build APK - Native Gradle (debug)
+        if: steps.locate.outputs.type == 'native' && github.event.inputs.build_type == 'debug'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Build APK - Native Gradle (release)
+        if: steps.locate.outputs.type == 'native' && github.event.inputs.build_type != 'debug'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Cari file APK hasil build
+        id: apk
+        run: |
+          APK_PATH=$(find "${{ steps.locate.outputs.dir }}" -name "*.apk" | head -n1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::File APK hasil build tidak ditemukan!"
+            exit 1
+          fi
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-apk
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 1
